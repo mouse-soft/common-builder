@@ -1,0 +1,167 @@
+name: build
+
+# Manually dispatched builds for registered private projects.
+# Security model: see README.md. In short: no public artifacts, no caches,
+# empty token permissions, all private build output withheld from public
+# logs, results returned to the private repository over SSH only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Registered project name (see projects.json)"
+        required: true
+        type: string
+      source_sha:
+        description: "Exact 40-character commit SHA to build"
+        required: true
+        type: string
+      label:
+        description: "Output label (used in the return branch name)"
+        required: true
+        type: string
+        default: "manual"
+
+permissions: {}
+
+concurrency:
+  group: build-${{ inputs.project }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+            python: python3
+          - os: windows-2022
+            platform: windows
+            arch: x86_64
+            python: python
+          - os: macos-14
+            platform: macos
+            arch: arm64
+            python: python3
+    runs-on: ${{ matrix.os }}
+    environment: private-build
+    timeout-minutes: 180
+    env:
+      CB_PROJECT: ${{ inputs.project }}
+      CB_SHA: ${{ inputs.source_sha }}
+      CB_LABEL: ${{ inputs.label }}
+      CB_PLATFORM: ${{ matrix.platform }}
+      CB_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out this builder repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs and resolve the project
+        shell: python
+        run: |
+          import json, os, re, sys
+          sha = os.environ["CB_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              print("Invalid source SHA.")
+              sys.exit(1)
+          label = os.environ["CB_LABEL"]
+          if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", label):
+              print("Invalid label.")
+              sys.exit(1)
+          with open("projects.json", encoding="utf-8") as f:
+              projects = json.load(f)["projects"]
+          project = projects.get(os.environ["CB_PROJECT"])
+          if project is None:
+              print("Unknown project.")
+              sys.exit(1)
+          out = os.environ["GITHUB_ENV"]
+          with open(out, "a", encoding="utf-8") as f:
+              f.write(f"CB_SOURCE_SSH={project['source_ssh']}\n")
+              f.write(f"CB_RECIPE={project['recipe']}\n")
+              f.write(f"CB_PREFIX={project['return_branch_prefix']}\n")
+          print("Project resolved.")
+
+      - name: Fetch the private source at the requested SHA
+        shell: bash
+        env:
+          SOURCE_SSH_KEY: ${{ secrets.SOURCE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOURCE_SSH_KEY}" ]; then
+            echo "Source credential is not configured."
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${SOURCE_SSH_KEY}" > ~/.ssh/source_key
+          chmod 600 ~/.ssh/source_key
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/source_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          work="${RUNNER_TEMP}/cb-src"
+          git clone --quiet --no-checkout "${CB_SOURCE_SSH}" "${work}"
+          git -C "${work}" checkout --quiet "${CB_SHA}"
+          actual="$(git -C "${work}" rev-parse HEAD)"
+          if [ "${actual}" != "${CB_SHA}" ]; then
+            echo "Source SHA mismatch."
+            exit 1
+          fi
+          echo "CB_SRC=${work}" >> "${GITHUB_ENV}"
+          echo "Source fetched."
+
+      - name: Run the private build recipe (output withheld)
+        shell: bash
+        run: |
+          set -uo pipefail
+          out="${RUNNER_TEMP}/cb-out"
+          mkdir -p "${out}"
+          log="${RUNNER_TEMP}/cb-build.log"
+          echo "CB_OUT=${out}" >> "${GITHUB_ENV}"
+          echo "CB_LOG=${log}" >> "${GITHUB_ENV}"
+          cd "${CB_SRC}"
+          if ${{ matrix.python }} "${CB_RECIPE}" --platform "${CB_PLATFORM}" --arch "${CB_ARCH}" --out "${out}" > "${log}" 2>&1; then
+            echo "CB_BUILD_OK=1" >> "${GITHUB_ENV}"
+            echo "Build finished."
+          else
+            echo "CB_BUILD_OK=0" >> "${GITHUB_ENV}"
+            echo "Build failed. The build log was withheld from this public log and returned privately."
+          fi
+
+      - name: Return results to the private repository
+        shell: bash
+        if: always()
+        run: |
+          set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/source_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          ret="${RUNNER_TEMP}/cb-return"
+          mkdir -p "${ret}"
+          cd "${ret}"
+          git init --quiet .
+          git config user.name "common-builder"
+          git config user.email "46545607+mouseos@users.noreply.github.com"
+          if [ "${CB_BUILD_OK:-0}" = "1" ]; then
+            cp "${CB_OUT}"/*.zip . 2>/dev/null || true
+          fi
+          if [ -f "${CB_LOG:-}" ]; then
+            cp "${CB_LOG}" build.log
+          fi
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to return."
+            exit 0
+          fi
+          git commit --quiet -m "common-builder output"
+          branch="${CB_PREFIX}/${CB_PROJECT}/${{ github.run_id }}-${CB_PLATFORM}-${CB_LABEL}"
+          git push --quiet "${CB_SOURCE_SSH}" "HEAD:refs/heads/${branch}"
+          echo "Results returned."
+
+      - name: Clean up
+        shell: bash
+        if: always()
+        run: |
+          rm -rf "${RUNNER_TEMP}/cb-src" "${RUNNER_TEMP}/cb-out" "${RUNNER_TEMP}/cb-return" "${RUNNER_TEMP}/cb-build.log" ~/.ssh/source_key
+          echo "Cleaned up."
