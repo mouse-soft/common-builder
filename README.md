@@ -26,9 +26,12 @@ release delivery. Builds run only on GitHub-hosted runners
    short-lived branch `common-builder-output/<project>/<run-id>-<os>` in a
    dedicated private drop repository (`mouse-soft/build-drops`), using a
    second deploy key (`RETURN_SSH_KEY`) that is scoped to that drop
-   repository only and cannot reach any source repository. A maintainer
-   collects the zips from there, creates the private release in the source
-   repository, and deletes the branches.
+   repository only and cannot reach any source repository. Zips over
+   ~95 MB are split into ~90 MB parts (`<zip>.partaa`, `<zip>.partab`, …),
+   because GitHub rejects files over 100 MB in a push; reassemble with
+   `cat <zip>.part* > <zip>`. A maintainer collects the zips from there,
+   creates the private release in the source repository, and deletes the
+   branches.
 6. The temporary source, outputs and SSH key are removed at the end of every
    job, success or failure.
 

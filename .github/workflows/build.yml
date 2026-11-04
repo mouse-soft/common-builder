@@ -133,6 +133,7 @@ jobs:
           fi
 
       - name: Return results to the private drop repository
+        id: return
         shell: bash
         if: always()
         env:
@@ -155,7 +156,19 @@ jobs:
           git config user.name "common-builder"
           git config user.email "46545607+mouseos@users.noreply.github.com"
           if [ "${CB_BUILD_OK:-0}" = "1" ]; then
-            cp "${CB_OUT}"/*.zip . 2>/dev/null || true
+            # GitHub rejects files over 100 MB in a push, and the packages
+            # are larger than that, so big zips are split into ~90 MB
+            # parts (zip.partaa, zip.partab, ...). Reassemble with
+            # `cat zip.part* > zip` after collecting the branch.
+            for z in "${CB_OUT}"/*.zip; do
+              [ -e "$z" ] || continue
+              size=$(stat -c%s "$z" 2>/dev/null || stat -f%z "$z")
+              if [ "$size" -gt 95000000 ]; then
+                split -b 90000000 "$z" "$(basename "$z").part"
+              else
+                cp "$z" .
+              fi
+            done
           fi
           if [ -f "${CB_LOG:-}" ]; then
             cp "${CB_LOG}" build.log
@@ -172,7 +185,12 @@ jobs:
 
       - name: Verdict
         shell: bash
+        if: always()
         run: |
+          if [ "${{ steps.return.outcome }}" != "success" ]; then
+            echo "Returning the results failed."
+            exit 1
+          fi
           if [ "${CB_BUILD_OK:-0}" != "1" ]; then
             echo "Build failed. Details were withheld from this public log and returned privately."
             exit 1
