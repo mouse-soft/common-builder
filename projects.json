@@ -1,1 +1,1 @@
-{"projects":{"obs-weather-plus":{"recipe":"runtime/native/build-ci.py","return_branch_prefix":"common-builder-output","source_repo":"mouse-soft/obs-weather-plus","source_ssh":"git@github.com:mouse-soft/obs-weather-plus.git"}}}
+{"projects":{"obs-weather-plus":{"recipe":"runtime/native/build-ci.py","return_branch_prefix":"common-builder-output","return_ssh":"git@github.com:mouse-soft/build-drops.git","source_repo":"mouse-soft/obs-weather-plus","source_ssh":"git@github.com:mouse-soft/obs-weather-plus.git"}}}

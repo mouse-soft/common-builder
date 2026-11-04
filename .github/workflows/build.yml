@@ -83,6 +83,7 @@ jobs:
           out = os.environ["GITHUB_ENV"]
           with open(out, "a", encoding="utf-8") as f:
               f.write(f"CB_SOURCE_SSH={project['source_ssh']}\n")
+              f.write(f"CB_RETURN_SSH={project['return_ssh']}\n")
               f.write(f"CB_RECIPE={project['recipe']}\n")
               f.write(f"CB_PREFIX={project['return_branch_prefix']}\n")
           print("Project resolved.")
@@ -131,12 +132,22 @@ jobs:
             echo "Build failed. The build log was withheld from this public log and returned privately."
           fi
 
-      - name: Return results to the private repository
+      - name: Return results to the private drop repository
         shell: bash
         if: always()
+        env:
+          RETURN_SSH_KEY: ${{ secrets.RETURN_SSH_KEY }}
         run: |
           set -euo pipefail
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/source_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          if [ -z "${RETURN_SSH_KEY}" ]; then
+            echo "Return credential is not configured."
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${RETURN_SSH_KEY}" > ~/.ssh/return_key
+          chmod 600 ~/.ssh/return_key
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/return_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
           ret="${RUNNER_TEMP}/cb-return"
           mkdir -p "${ret}"
           cd "${ret}"
@@ -156,12 +167,12 @@ jobs:
           fi
           git commit --quiet -m "common-builder output"
           branch="${CB_PREFIX}/${CB_PROJECT}/${{ github.run_id }}-${CB_PLATFORM}-${CB_LABEL}"
-          git push --quiet "${CB_SOURCE_SSH}" "HEAD:refs/heads/${branch}"
+          git push --quiet "${CB_RETURN_SSH}" "HEAD:refs/heads/${branch}"
           echo "Results returned."
 
       - name: Clean up
         shell: bash
         if: always()
         run: |
-          rm -rf "${RUNNER_TEMP}/cb-src" "${RUNNER_TEMP}/cb-out" "${RUNNER_TEMP}/cb-return" "${RUNNER_TEMP}/cb-build.log" ~/.ssh/source_key
+          rm -rf "${RUNNER_TEMP}/cb-src" "${RUNNER_TEMP}/cb-out" "${RUNNER_TEMP}/cb-return" "${RUNNER_TEMP}/cb-build.log" ~/.ssh/source_key ~/.ssh/return_key
           echo "Cleaned up."
