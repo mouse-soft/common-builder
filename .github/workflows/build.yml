@@ -170,6 +170,15 @@ jobs:
           git push --quiet "${CB_RETURN_SSH}" "HEAD:refs/heads/${branch}"
           echo "Results returned."
 
+      - name: Verdict
+        shell: bash
+        run: |
+          if [ "${CB_BUILD_OK:-0}" != "1" ]; then
+            echo "Build failed. Details were withheld from this public log and returned privately."
+            exit 1
+          fi
+          echo "Build succeeded."
+
       - name: Clean up
         shell: bash
         if: always()
