@@ -2,7 +2,7 @@
 
 Manually dispatched GitHub-hosted builds for private projects, with private
 release delivery. Builds run only on GitHub-hosted runners
-(`ubuntu-24.04`, `windows-2022`, `macos-14`). No self-hosted runners.
+(`ubuntu-24.04`, `windows-2022`, `macos-15`). No self-hosted runners.
 This repository is public and contains **only generic build logic** — no
 project names, source locations, product details, artifacts, detailed
 logs, or secrets.

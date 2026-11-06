@@ -40,7 +40,7 @@ jobs:
             platform: windows
             arch: x86_64
             python: python
-          - os: macos-14
+          - os: macos-15
             platform: macos
             arch: arm64
             python: python3
@@ -121,7 +121,7 @@ jobs:
           ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>>"${CB_LOG}"
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/source_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
           export GIT_TERMINAL_PROMPT=0
-          if ! git clone --quiet --no-checkout --branch "${ref}" "${source_ssh}" "${CB_SRC}" >>"${CB_LOG}" 2>&1; then
+          if ! git clone --quiet --branch "${ref}" "${source_ssh}" "${CB_SRC}" >>"${CB_LOG}" 2>&1; then
             echo "Fetching the source failed. Details were withheld from this public log."
             exit 1
           fi
