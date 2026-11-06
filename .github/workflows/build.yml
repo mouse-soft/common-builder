@@ -1,26 +1,23 @@
 name: build
+run-name: build
 
-# Manually dispatched builds for registered private projects.
-# Security model: see README.md. In short: no public artifacts, no caches,
-# empty token permissions, all private build output withheld from public
-# logs, results returned to the private repository over SSH only.
+# Manually dispatched builds for private projects.
+# Security model: see README.md. In short: this public repository contains
+# only generic build logic. Everything project-specific (source location,
+# build recipe path, target ref, return location) lives in secrets of a
+# per-project GitHub environment and is never placed in workflow inputs,
+# job environment variables, or step output, because Actions prints env
+# values into the public log. All tool output that could contain private
+# values is redirected to a private log file that is returned through the
+# private drop channel only. Public log lines are fixed strings.
 
 on:
   workflow_dispatch:
     inputs:
       project:
-        description: "Registered project name (see projects.json)"
+        description: "Opaque build-environment code for the project"
         required: true
         type: string
-      source_sha:
-        description: "Exact 40-character commit SHA to build"
-        required: true
-        type: string
-      label:
-        description: "Output label (used in the return branch name)"
-        required: true
-        type: string
-        default: "manual"
 
 permissions: {}
 
@@ -48,12 +45,9 @@ jobs:
             arch: arm64
             python: python3
     runs-on: ${{ matrix.os }}
-    environment: private-build
+    environment: ${{ inputs.project }}
     timeout-minutes: 180
     env:
-      CB_PROJECT: ${{ inputs.project }}
-      CB_SHA: ${{ inputs.source_sha }}
-      CB_LABEL: ${{ inputs.label }}
       CB_PLATFORM: ${{ matrix.platform }}
       CB_ARCH: ${{ matrix.arch }}
     steps:
@@ -62,84 +56,106 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate inputs and resolve the project
+      - name: Resolve the project configuration
         shell: python
+        env:
+          BUILD_CONFIG_JSON: ${{ secrets.BUILD_CONFIG_JSON }}
         run: |
-          import json, os, re, sys
-          sha = os.environ["CB_SHA"]
-          if not re.fullmatch(r"[0-9a-f]{40}", sha):
-              print("Invalid source SHA.")
+          import json, os, sys
+          raw = os.environ.get("BUILD_CONFIG_JSON", "")
+          try:
+              cfg = json.loads(raw)
+              source_ssh = cfg["source_ssh"]
+              recipe = cfg["recipe"]
+              return_ssh = cfg["return_ssh"]
+              ref = cfg["ref"]
+              prefix = cfg["branch_prefix"]
+              for value in (source_ssh, recipe, return_ssh, ref, prefix):
+                  if not isinstance(value, str) or not value or "\n" in value:
+                      raise ValueError("bad value")
+          except Exception:
+              print("Project configuration is not available.")
               sys.exit(1)
-          label = os.environ["CB_LABEL"]
-          if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", label):
-              print("Invalid label.")
-              sys.exit(1)
-          with open("projects.json", encoding="utf-8") as f:
-              projects = json.load(f)["projects"]
-          project = projects.get(os.environ["CB_PROJECT"])
-          if project is None:
-              print("Unknown project.")
-              sys.exit(1)
-          out = os.environ["GITHUB_ENV"]
-          with open(out, "a", encoding="utf-8") as f:
-              f.write(f"CB_SOURCE_SSH={project['source_ssh']}\n")
-              f.write(f"CB_RETURN_SSH={project['return_ssh']}\n")
-              f.write(f"CB_RECIPE={project['recipe']}\n")
-              f.write(f"CB_PREFIX={project['return_branch_prefix']}\n")
-          print("Project resolved.")
+          base = os.path.join(os.environ["RUNNER_TEMP"], "cb-config")
+          os.makedirs(base, exist_ok=True)
+          def put(name, value):
+              with open(os.path.join(base, name), "w", encoding="utf-8") as f:
+                  f.write(value)
+          put("source_ssh", source_ssh)
+          put("recipe", recipe)
+          put("return_ssh", return_ssh)
+          put("ref", ref)
+          put("prefix", prefix)
+          temp = os.environ["RUNNER_TEMP"]
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write("CB_CFG=" + base + "\n")
+              f.write("CB_SRC=" + os.path.join(temp, "cb-src") + "\n")
+              f.write("CB_OUT=" + os.path.join(temp, "cb-out") + "\n")
+              f.write("CB_LOG=" + os.path.join(temp, "cb-build.log") + "\n")
+              f.write("CB_FETCH_OK=0\n")
+              f.write("CB_BUILD_OK=0\n")
+              f.write("CB_RETURN_OK=0\n")
+          print("Project configuration loaded.")
 
-      - name: Fetch the private source at the requested SHA
+      - name: Fetch the private source
         shell: bash
         env:
           SOURCE_SSH_KEY: ${{ secrets.SOURCE_SSH_KEY }}
         run: |
-          set -euo pipefail
           if [ -z "${SOURCE_SSH_KEY}" ]; then
             echo "Source credential is not configured."
+            exit 1
+          fi
+          if [ ! -f "${CB_CFG}/source_ssh" ]; then
+            echo "Project configuration is missing."
             exit 1
           fi
           mkdir -p ~/.ssh
           printf '%s\n' "${SOURCE_SSH_KEY}" > ~/.ssh/source_key
           chmod 600 ~/.ssh/source_key
-          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          trap 'rm -f ~/.ssh/source_key' EXIT
+          source_ssh="$(cat "${CB_CFG}/source_ssh")"
+          ref="$(cat "${CB_CFG}/ref")"
+          : > "${CB_LOG}"
+          echo "ref: ${ref}" >> "${CB_LOG}"
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>>"${CB_LOG}"
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/source_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
-          work="${RUNNER_TEMP}/cb-src"
-          git clone --quiet --no-checkout "${CB_SOURCE_SSH}" "${work}"
-          git -C "${work}" checkout --quiet "${CB_SHA}"
-          actual="$(git -C "${work}" rev-parse HEAD)"
-          if [ "${actual}" != "${CB_SHA}" ]; then
-            echo "Source SHA mismatch."
+          export GIT_TERMINAL_PROMPT=0
+          if ! git clone --quiet --no-checkout --branch "${ref}" "${source_ssh}" "${CB_SRC}" >>"${CB_LOG}" 2>&1; then
+            echo "Fetching the source failed. Details were withheld from this public log."
             exit 1
           fi
-          echo "CB_SRC=${work}" >> "${GITHUB_ENV}"
+          actual="$(git -C "${CB_SRC}" rev-parse HEAD 2>>"${CB_LOG}")"
+          echo "sha: ${actual}" >> "${CB_LOG}"
+          rm -f ~/.ssh/source_key
+          trap - EXIT
+          echo "CB_FETCH_OK=1" >> "${GITHUB_ENV}"
           echo "Source fetched."
 
       - name: Run the private build recipe (output withheld)
         shell: bash
+        if: ${{ env.CB_FETCH_OK == '1' }}
         run: |
-          set -uo pipefail
-          out="${RUNNER_TEMP}/cb-out"
-          mkdir -p "${out}"
-          log="${RUNNER_TEMP}/cb-build.log"
-          echo "CB_OUT=${out}" >> "${GITHUB_ENV}"
-          echo "CB_LOG=${log}" >> "${GITHUB_ENV}"
+          mkdir -p "${CB_OUT}"
+          recipe="$(cat "${CB_CFG}/recipe")"
           cd "${CB_SRC}"
-          if ${{ matrix.python }} "${CB_RECIPE}" --platform "${CB_PLATFORM}" --arch "${CB_ARCH}" --out "${out}" > "${log}" 2>&1; then
+          if ${{ matrix.python }} "${recipe}" --platform "${CB_PLATFORM}" --arch "${CB_ARCH}" --out "${CB_OUT}" >> "${CB_LOG}" 2>&1; then
             echo "CB_BUILD_OK=1" >> "${GITHUB_ENV}"
             echo "Build finished."
           else
-            echo "CB_BUILD_OK=0" >> "${GITHUB_ENV}"
             echo "Build failed. The build log was withheld from this public log and returned privately."
           fi
 
       - name: Return results to the private drop repository
-        id: return
         shell: bash
         if: always()
         env:
           RETURN_SSH_KEY: ${{ secrets.RETURN_SSH_KEY }}
         run: |
-          set -euo pipefail
+          if [ ! -f "${CB_CFG}/return_ssh" ]; then
+            echo "Nothing to return."
+            exit 0
+          fi
           if [ -z "${RETURN_SSH_KEY}" ]; then
             echo "Return credential is not configured."
             exit 1
@@ -147,12 +163,18 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${RETURN_SSH_KEY}" > ~/.ssh/return_key
           chmod 600 ~/.ssh/return_key
-          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          trap 'rm -f ~/.ssh/return_key' EXIT
+          return_ssh="$(cat "${CB_CFG}/return_ssh")"
+          prefix="$(cat "${CB_CFG}/prefix")"
+          rlog="${RUNNER_TEMP}/cb-return.log"
+          : > "${rlog}"
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>>"${rlog}"
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/return_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          export GIT_TERMINAL_PROMPT=0
           ret="${RUNNER_TEMP}/cb-return"
           mkdir -p "${ret}"
           cd "${ret}"
-          git init --quiet .
+          git init --quiet . >>"${rlog}" 2>&1
           git config user.name "common-builder"
           git config user.email "46545607+mouseos@users.noreply.github.com"
           if [ "${CB_BUILD_OK:-0}" = "1" ]; then
@@ -164,30 +186,43 @@ jobs:
               [ -e "$z" ] || continue
               size=$(stat -c%s "$z" 2>/dev/null || stat -f%z "$z")
               if [ "$size" -gt 95000000 ]; then
-                split -b 90000000 "$z" "$(basename "$z").part"
+                split -b 90000000 "$z" "$(basename "$z").part" >>"${rlog}" 2>&1
               else
-                cp "$z" .
+                cp "$z" . >>"${rlog}" 2>&1
               fi
             done
           fi
           if [ -f "${CB_LOG:-}" ]; then
             cp "${CB_LOG}" build.log
           fi
-          git add -A
+          git add -A >>"${rlog}" 2>&1
           if git diff --cached --quiet; then
             echo "Nothing to return."
+            rm -f ~/.ssh/return_key
+            trap - EXIT
+            echo "CB_RETURN_OK=1" >> "${GITHUB_ENV}"
             exit 0
           fi
-          git commit --quiet -m "common-builder output"
-          branch="${CB_PREFIX}/${CB_PROJECT}/${{ github.run_id }}-${CB_PLATFORM}-${CB_LABEL}"
-          git push --quiet "${CB_RETURN_SSH}" "HEAD:refs/heads/${branch}"
+          git commit --quiet -m "common-builder output" >>"${rlog}" 2>&1
+          branch="${prefix}/${{ github.run_id }}-${CB_PLATFORM}"
+          if ! git push --quiet "${return_ssh}" "HEAD:refs/heads/${branch}" >>"${rlog}" 2>&1; then
+            echo "Returning the results failed. Details were withheld from this public log."
+            exit 1
+          fi
+          rm -f ~/.ssh/return_key
+          trap - EXIT
+          echo "CB_RETURN_OK=1" >> "${GITHUB_ENV}"
           echo "Results returned."
 
       - name: Verdict
         shell: bash
         if: always()
         run: |
-          if [ "${{ steps.return.outcome }}" != "success" ]; then
+          if [ "${CB_FETCH_OK:-0}" != "1" ]; then
+            echo "Fetching the source did not succeed."
+            exit 1
+          fi
+          if [ "${CB_RETURN_OK:-0}" != "1" ]; then
             echo "Returning the results failed."
             exit 1
           fi
@@ -201,5 +236,5 @@ jobs:
         shell: bash
         if: always()
         run: |
-          rm -rf "${RUNNER_TEMP}/cb-src" "${RUNNER_TEMP}/cb-out" "${RUNNER_TEMP}/cb-return" "${RUNNER_TEMP}/cb-build.log" ~/.ssh/source_key ~/.ssh/return_key
+          rm -rf "${RUNNER_TEMP}/cb-src" "${RUNNER_TEMP}/cb-out" "${RUNNER_TEMP}/cb-return" "${RUNNER_TEMP}/cb-config" "${RUNNER_TEMP}/cb-build.log" "${RUNNER_TEMP}/cb-return.log" ~/.ssh/source_key ~/.ssh/return_key
           echo "Cleaned up."
